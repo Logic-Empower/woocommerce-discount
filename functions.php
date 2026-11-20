@@ -37,8 +37,8 @@ function build_wc_product_query_args(array $rules, int $limit = 200, int $page =
                     : $excluded_onsale_ids;
             }
         } else if ($action == "remove") {
-            // 1. Get all sale IDs
-            $all_sale_ids = wc_get_product_ids_on_sale();
+            // 1. Get product IDs with sale price or sale schedule data.
+            $all_sale_ids = get_discounted_product_ids_for_removal();
 
             // 2. The shared exclusions below will remove custom excluded IDs and taxonomies.
             $args['include'] = $all_sale_ids;
@@ -69,8 +69,10 @@ function build_wc_product_query_args(array $rules, int $limit = 200, int $page =
             );
         }
 
-        if (!empty($rules["include"]["product_ids"])) {
-            $args['include'] = $rules["include"]["product_ids"];
+        if (!empty($rules["include"]["product_ids"]) || !empty($rules['include']['product_skus'])) {
+            $ids = discount_rule_product_ids($rules['include']);
+            // An unmatched SKU must never turn an explicit selection into all products.
+            $args['include'] = $ids ?: [0];
         }
 
         add_discount_tax_query($args, 'product_cat', $rules["include"]["categories"], 'IN');
@@ -79,13 +81,65 @@ function build_wc_product_query_args(array $rules, int $limit = 200, int $page =
         add_discount_attribute_tax_queries($args, $rules["include"], 'IN');
     }
 
-    add_discount_product_id_exclusions($args, $rules["exclude"]["product_ids"]);
+    add_discount_product_id_exclusions($args, discount_rule_product_ids($rules['exclude']));
     add_discount_tax_query($args, 'product_cat', $rules["exclude"]["categories"], 'NOT IN');
     add_discount_tax_query($args, 'product_tag', $rules["exclude"]["tags"], 'NOT IN');
     add_discount_tax_query($args, 'product_brand', $rules["exclude"]["brands"], 'NOT IN');
     add_discount_attribute_tax_queries($args, $rules["exclude"], 'NOT IN');
 
     return $args;
+}
+
+function discount_rule_product_ids(array $group): array
+{
+    $ids = $group['product_ids'] ?? [];
+    foreach (array_unique($group['product_skus'] ?? []) as $sku) {
+        $id = wc_get_product_id_by_sku($sku);
+        $product = $id ? wc_get_product($id) : false;
+        if ($product && $product->is_type(['simple', 'variable'])) {
+            $ids[] = $id;
+        } else {
+            echo 'SKU "' . $sku . '": no simple or parent variable product found; this SKU was skipped.' . "\n";
+        }
+    }
+
+    // The same product may appear by ID, by SKU, or on several imported rows.
+    return array_values(array_unique(array_filter(array_map('absint', $ids))));
+}
+
+function get_discounted_product_ids_for_removal(): array
+{
+    $ids = wc_get_product_ids_on_sale();
+
+    $scheduled_ids = get_posts([
+        'post_type' => ['product', 'product_variation'],
+        'post_status' => 'publish',
+        'fields' => 'ids',
+        'posts_per_page' => -1,
+        'meta_query' => [
+            'relation' => 'OR',
+            [
+                'key' => '_sale_price',
+                'value' => '',
+                'compare' => '!=',
+            ],
+            [
+                'key' => '_sale_price_dates_from',
+                'compare' => 'EXISTS',
+            ],
+            [
+                'key' => '_sale_price_dates_to',
+                'compare' => 'EXISTS',
+            ],
+        ],
+    ]);
+
+    foreach ($scheduled_ids as $product_id) {
+        $parent_id = wp_get_post_parent_id($product_id);
+        $ids[] = $parent_id ? $parent_id : $product_id;
+    }
+
+    return array_values(array_unique(array_filter(array_map('absint', $ids))));
 }
 
 function add_discount_product_id_exclusions(array &$args, array $product_ids): void
@@ -111,7 +165,7 @@ function add_discount_product_id_exclusions(array &$args, array $product_ids): v
 
 function discount_rule_group_has_selectors(array $rule_group): bool
 {
-    foreach (['product_ids', 'categories', 'tags', 'brands'] as $key) {
+    foreach (['product_ids', 'product_skus', 'categories', 'tags', 'brands'] as $key) {
         if (!empty($rule_group[$key])) {
             return true;
         }
@@ -193,7 +247,7 @@ function apply_sale_price_discount(array $rules)
     $processed_variations = 0;
 
     echo "🔍 Processing products in batches of {$args['limit']}...\n";
-    echo "ID,RegularPrice,SalePrice,Name,Brand\n";
+    echo discount_add_output_header($rules) . "\n";
 
     while (true) {
 
@@ -282,7 +336,7 @@ function apply_discount_to_product(WC_Product $product, array $rules): bool
 
     if(!$dryRun){
         $product->set_sale_price(wc_format_decimal($sale_price));
-        $product->set_price(wc_format_decimal($sale_price));
+        apply_discount_schedule_to_product($product, $rules, $sale_price, $regular_price);
         $product->save();
     }
     
@@ -300,14 +354,113 @@ function apply_discount_to_product(WC_Product $product, array $rules): bool
     if (!empty($terms) && !is_wp_error($terms)) {
 	    $brand = implode(', ', wp_list_pluck($terms, 'name'));
 	}     
-	echo "{$product->get_id()},{$regular_price},{$sale_price},{$product->get_name()},{$brand}\n";
+    $row = [
+        $product->get_id(),
+        $regular_price,
+        $sale_price,
+        $product->get_name(),
+        $brand,
+    ];
+
+    if (discount_schedule_has_output_dates($rules)) {
+        $row[] = discount_schedule_output_date($rules, 'start_date');
+        $row[] = discount_schedule_output_date($rules, 'end_date');
+    }
+
+    discount_output_csv_row($row);
 
     return true;
+}
+
+function discount_add_output_header(array $rules): string
+{
+    $columns = ['ID', 'RegularPrice', 'SalePrice', 'Name', 'Brand'];
+
+    if (discount_schedule_has_output_dates($rules)) {
+        $columns[] = 'StartDate';
+        $columns[] = 'EndDate';
+    }
+
+    return implode(',', $columns);
+}
+
+function discount_output_csv_row(array $row): void
+{
+    // Quote names and brands correctly, including commas, quotes and line breaks.
+    $stream = fopen('php://output', 'w');
+    fputcsv($stream, $row, ',', '"', '');
+    fclose($stream);
+}
+
+function discount_schedule_has_output_dates(array $rules): bool
+{
+    return discount_schedule_is_enabled($rules)
+        && (discount_schedule_output_date($rules, 'start_date') !== '' || discount_schedule_output_date($rules, 'end_date') !== '');
+}
+
+function discount_schedule_output_date(array $rules, string $key): string
+{
+    if (empty($rules['schedule'][$key]) || !is_string($rules['schedule'][$key])) {
+        return '';
+    }
+
+    $timestamp = strtotime($rules['schedule'][$key]);
+
+    return $timestamp === false ? '' : gmdate('Y-m-d', $timestamp);
 }
 
 function discount_product_has_sale_price(WC_Product $product): bool
 {
     return (string) $product->get_sale_price() !== '' || $product->is_on_sale();
+}
+
+function apply_discount_schedule_to_product(WC_Product $product, array $rules, float $sale_price, float $regular_price): void
+{
+    if (!discount_schedule_is_enabled($rules)) {
+        $product->set_date_on_sale_from(null);
+        $product->set_date_on_sale_to(null);
+        $product->set_price(wc_format_decimal($sale_price));
+        return;
+    }
+
+    $from = discount_schedule_date($rules, 'start_date', false);
+    $to = discount_schedule_date($rules, 'end_date', true);
+
+    $product->set_date_on_sale_from($from);
+    $product->set_date_on_sale_to($to);
+
+    $active_now = discount_schedule_is_active_now($from, $to);
+    $product->set_price(wc_format_decimal($active_now ? $sale_price : $regular_price));
+}
+
+function discount_schedule_is_enabled(array $rules): bool
+{
+    return !empty($rules['schedule']['enabled']);
+}
+
+function discount_schedule_date(array $rules, string $key, bool $end_of_day): ?WC_DateTime
+{
+    if (empty($rules['schedule'][$key]) || !is_string($rules['schedule'][$key])) {
+        return null;
+    }
+
+    try {
+        $time = $end_of_day ? ' 23:59:59' : ' 00:00:00';
+        return new WC_DateTime($rules['schedule'][$key] . $time, wp_timezone());
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+function discount_schedule_is_active_now(?WC_DateTime $from, ?WC_DateTime $to): bool
+{
+    if (!$from || !$to) {
+        return false;
+    }
+
+    $now = current_time('timestamp', true);
+
+    return $from->getTimestamp() <= $now && $to->getTimestamp() >= $now;
 }
 
 function apply_tag_to_discounted_product(WC_Product $product, string $tag_slug)
@@ -345,7 +498,7 @@ function remove_product_discount(array $rules)
     $processed_variations = 0;
 
     echo "🔍 Processing products in batches of {$args['limit']}...\n";
-    echo "ID,RegularPrice,Name,Brand\n";
+    echo "ID,RegularPrice,SalePrice,Name,Brand\n";
 
     while (true) {
         $product_ids = wc_get_products($args);
@@ -406,6 +559,8 @@ function restore_product_price(WC_Product $product, array $rules = [])
     $dryRun = isset($rules["dry_run"]) && $rules["dry_run"] === true;
 
     $regular_price = $product->get_regular_price();
+    // Capture the sale price before clearing it, for both previews and actual runs.
+    $sale_price = $product->get_sale_price();
 
     if ($regular_price === '') {
         return;
@@ -415,6 +570,8 @@ function restore_product_price(WC_Product $product, array $rules = [])
 
         // Remove sale price
         $product->set_sale_price('');
+        $product->set_date_on_sale_from(null);
+        $product->set_date_on_sale_to(null);
 
         // Restore price from regular price
         $product->set_price($regular_price);
@@ -430,16 +587,25 @@ function restore_product_price(WC_Product $product, array $rules = [])
     if (!empty($terms) && !is_wp_error($terms)) {
 	    $brand = implode(', ', wp_list_pluck($terms, 'name'));
 	}     
-	echo "{$product->get_id()},{$regular_price},{$product->get_name()},{$brand}\n";
+    discount_output_csv_row([$product->get_id(), $regular_price, $sale_price, $product->get_name(), $brand]);
 }
 
 function validate_add_discount_rules($rules, $action = "add")
 {
+    foreach (['include', 'exclude'] as $group) {
+        if (isset($rules[$group]['product_skus'])) {
+            if (!is_array($rules[$group]['product_skus'])) return false;
+            foreach ($rules[$group]['product_skus'] as $sku) {
+                if (!is_string($sku) || trim($sku) === '') return false;
+            }
+        }
+    }
     if ($action == "add") {
         if (!isset($rules["discount_type"]) || !in_array($rules["discount_type"], ["percentage", "fixed"])) return false;
         if (!isset($rules["discount_value"]) || !is_numeric($rules["discount_value"]) || $rules["discount_value"] <= 0) return false;
         if (!isset($rules["exclude_on_sale"]) || !is_bool($rules["exclude_on_sale"])) return false;
         if (!isset($rules["add_tag"]) || !is_string($rules["add_tag"])) return false;
+        if (!validate_discount_schedule_rules($rules)) return false;
     }
     if (!isset($rules["apply_to_all"]) || !is_bool($rules["apply_to_all"])) return false;
     if (
@@ -484,6 +650,43 @@ function validate_add_discount_rules($rules, $action = "add")
         }
     }
     return true;
+}
+
+function validate_discount_schedule_rules(array $rules): bool
+{
+    if (!isset($rules['schedule'])) {
+        return true;
+    }
+
+    if (!is_array($rules['schedule'])) {
+        return false;
+    }
+
+    $schedule = array_merge(
+        [
+            'enabled' => false,
+            'start_date' => '',
+            'end_date' => '',
+        ],
+        $rules['schedule']
+    );
+
+    if (!is_bool($schedule['enabled']) || !is_string($schedule['start_date']) || !is_string($schedule['end_date'])) {
+        return false;
+    }
+
+    if (!$schedule['enabled']) {
+        return true;
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $schedule['start_date']) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $schedule['end_date'])) {
+        return false;
+    }
+
+    $start = strtotime($schedule['start_date']);
+    $end = strtotime($schedule['end_date']);
+
+    return $start !== false && $end !== false && $start <= $end;
 }
 
 function readSettings($action = "add"){

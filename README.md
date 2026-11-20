@@ -52,6 +52,24 @@ wp-content/plugins/woocommerce-discount/
 
 The SSH scripts still work and continue to use the same JSON files.
 
+### Admin rule selectors
+
+Both discount tabs provide searchable, multiple-selection dropdowns for include/exclude categories, tags, brands, and global attribute terms. Options come from the database, including terms with no assigned products. Product IDs remain comma-, space-, or newline-separated text.
+
+The dropdowns display term names and save the same slug arrays used by the CLI scripts. Previously saved terms that are no longer available remain selected and are labelled accordingly. Discount calculations, product matching, exclusions, scheduling, and dry-run processing are unchanged.
+
+Brief help explains dry runs, starting from all products, and how include/exclude filters combine. The discount value displays `%` for percentage discounts and a currency-amount explanation for fixed discounts.
+
+### Product SKUs and CSV import
+
+Both tabs support Product IDs and Product SKUs in Include and Exclude rules. Enter one SKU per line; punctuation, spaces, and leading zeros are retained. IDs and SKUs form one combined product list, which is still narrowed by the selected category, brand, tag, and attribute filters. Exclusions take precedence. Starting from all products still ignores Include rules.
+
+Use **Download sample CSV** and replace its example values with your products. The format is exactly `ID,SKU`; either cell may be blank. **Import CSV** appends values to that rule group's fields without saving settings or running discounts. Files are read in the browser (maximum 5 MB), and invalid CSV leaves the fields unchanged. Save or dry-run after reviewing the imported fields.
+
+Duplicate IDs/SKUs are removed from each list. At run time, SKU matches are converted to product IDs and combined with entered IDs, so a product identified by both columns is processed once. Unknown SKUs are skipped with a message; an unmatched Include SKU never selects all products. SKUs target simple or parent variable products, matching the existing product scope; use a parent's SKU to process all its variations, not a variation SKU.
+
+JSON rules may optionally include `"product_skus": ["WATCH-001", "00042"]` inside either rule group. Existing JSON files without this key continue to work.
+
 ---
 
 ## 2) Configuration Files
@@ -88,6 +106,11 @@ Example `add-discount.json`:
         "categories": [],
         "tags": [],
         "brands": []
+    },
+    "schedule": {
+        "enabled": false,
+        "start_date": "",
+        "end_date": ""
     },
     "add_tag": "discounted"
 }
@@ -252,6 +275,11 @@ And optionally adds a tag to the product.
             "pa_gender": ["women"]
         }
     },
+    "schedule": {
+        "enabled": false,
+        "start_date": "",
+        "end_date": ""
+    },
     "add_tag": "valentines-day"
 }
 ```
@@ -311,6 +339,29 @@ This lets you build rules such as:
 If `true`, the script will exclude products that are already on sale.
 
 > Note: This is only applied when `apply_to_all = false`, or when `apply_to_all = true` with `action = add`.
+
+---
+
+#### `schedule`
+- Type: `object`
+- Applies to add-discount rules only
+
+If `enabled` is `true`, the script saves WooCommerce sale start/end dates on every matched product or variation.
+
+```json
+"schedule": {
+  "enabled": true,
+  "start_date": "2026-06-20",
+  "end_date": "2026-06-23"
+}
+```
+
+- `start_date`: sale starts at the beginning of this date.
+- `end_date`: sale ends at the end of this date.
+- Dates must use `YYYY-MM-DD`.
+- If the schedule starts in the future, the sale price is stored but the current price remains the regular price until WooCommerce activates the scheduled sale.
+- If `enabled` is `false`, sale date fields are cleared when applying the discount.
+- When schedule dates are enabled, the run output and downloadable CSV include `StartDate` and `EndDate` columns in `Y-m-d` format.
 
 ---
 
@@ -382,6 +433,11 @@ Example:
   "discount_value": 20,
   "apply_to_all": false,
   "exclude_on_sale": true,
+  "schedule": {
+    "enabled": false,
+    "start_date": "",
+    "end_date": ""
+  },
   "exclude": {
     "product_ids": [],
     "categories": [],
@@ -462,6 +518,7 @@ If set, the script will add this product tag to discounted products.
 This script removes the discount by:
 
 - Clearing `sale_price`
+- Clearing sale start/end dates
 - Restoring `price` back to `regular_price`
 
 ---
@@ -499,13 +556,13 @@ There are two modes:
 
 The script will:
 
-1. Load **all product IDs currently on sale** using:
+1. Load products with sale price data or sale schedule data. This includes currently active sales and future scheduled sales.
 
 ```php
-wc_get_product_ids_on_sale();
+get_discounted_product_ids_for_removal();
 ```
 
-2. Remove discounts from them.
+2. Remove discounts and sale start/end dates from them.
 
 You can still exclude some products using:
 
@@ -635,6 +692,8 @@ wordpress/
 
 ## 11) Output Example
 
+The admin page displays a results panel above the settings, with a dry-run/live-run label, summary counts, and a scrollable product price table. Removal results show the sale price captured before removal beside the regular price, plus the discount amount and percentage. Empty runs and validation messages are displayed separately. The Download CSV button remains available; names and brands containing commas, quotes, or line breaks are quoted correctly.
+
 The script prints a CSV header and processes each product, outputting details:
 
 For add-discount.php:
@@ -647,9 +706,9 @@ ID,RegularPrice,SalePrice,Name,Brand
 
 For remove-discount.php:
 ```
-ID,RegularPrice,Name,Brand
-123,100.00,Product Name,Casio
-124,200.00,Another Product,
+ID,RegularPrice,SalePrice,Name,Brand
+123,100.00,90.00,Product Name,Casio
+124,200.00,180.00,Another Product,
 ...
 ```
 
